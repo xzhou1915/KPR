@@ -4,35 +4,22 @@ FILE = "sample.xlsx"
 
 wb = openpyxl.load_workbook(FILE, data_only=True)
 
-# --- Tenor curve ---
-ws_curve = wb["sample"]
-rows_curve = list(ws_curve.iter_rows(values_only=True))[1:]  # skip header
-# columns: Date, Ticker, Days, Value
-tenors = [(row[2], row[1]) for row in rows_curve]  # [(days, ticker), ...]
-tenor_days   = [t[0] for t in tenors]
-tenor_labels = [t[1] for t in tenors]
-
-# Build interval buckets: Spot-1W, 1W-1M, ...
-def short_label(ticker):
-    """CNH1M Curncy -> 1M,  CNH Curncy -> Spot"""
+# --- Tenor nodes ---
+ws_rate = wb["ForwardRate"]
+rows_rate = [r for r in ws_rate.iter_rows(values_only=True)][1:]  # skip header
+nodes = [(row[2], row[1]) for row in rows_rate if row[2] is not None]
+node_days  = [n[0] for n in nodes]
+node_names = []
+for _, ticker in nodes:
     name = ticker.replace(" Curncy", "").replace("CNH", "")
-    return name if name else "Spot"
-
-intervals = []
-for i in range(len(tenors) - 1):
-    lo_days  = tenor_days[i]
-    hi_days  = tenor_days[i + 1]
-    label    = f"{short_label(tenor_labels[i])}-{short_label(tenor_labels[i+1])}"
-    intervals.append((lo_days, hi_days, label))
-# Last bucket: 2Y+
-intervals.append((tenor_days[-1], float("inf"), f"{short_label(tenor_labels[-1])}+"))
+    node_names.append(name if name else "Spot")
 
 # --- Exposure ---
 ws_exp = wb["Exposure"]
 rows_exp = list(ws_exp.iter_rows(values_only=True))[1:]  # skip header
 
-spot_delta = 0.0
-bucket_risk = {iv[2]: 0.0 for iv in intervals}
+spot_delta   = 0.0
+node_exp     = {name: 0.0 for name in node_names}
 
 for date, value_date, usd_exp in rows_exp:
     if usd_exp is None:
@@ -41,24 +28,45 @@ for date, value_date, usd_exp in rows_exp:
     days = (value_date - date).days
     spot_delta += usd_exp
 
-    for lo, hi, label in intervals:
-        if lo <= days < hi:
-            bucket_risk[label] += usd_exp
+    # Clamp beyond last node
+    if days >= node_days[-1]:
+        node_exp[node_names[-1]] += usd_exp
+        continue
+
+    # At or before spot node
+    if days <= node_days[0]:
+        node_exp[node_names[0]] += usd_exp
+        continue
+
+    # Interpolate between surrounding nodes
+    for i in range(len(nodes) - 1):
+        lo, hi = node_days[i], node_days[i + 1]
+        if lo <= days <= hi:
+            w_hi = (days - lo) / (hi - lo)
+            node_exp[node_names[i]]     += usd_exp * (1 - w_hi)
+            node_exp[node_names[i + 1]] += usd_exp * w_hi
             break
-    else:
-        # beyond last bucket
-        bucket_risk[intervals[-1][2]] += usd_exp
+
+# --- Segment exposures via reverse cumulative sum ---
+# segment[A→B] = sum of node_exp at B and all nodes beyond B
+# because those trades are all exposed to the A→B segment of the curve
+segment_exp = {}
+running = 0.0
+for i in range(len(nodes) - 1, 0, -1):
+    running += node_exp[node_names[i]]
+    segment_exp[f"{node_names[i-1]}-{node_names[i]}"] = running
+
+ordered = list(reversed(list(segment_exp.items())))
 
 # --- Output ---
-W = 42
+W = 46
 print("=" * W)
 print("  USDCNH Forward Portfolio Risk")
 print("=" * W)
 print(f"\n  Spot Delta:  ${spot_delta:>15,.0f}\n")
-print("  Bucket Points Risk (USD notional):")
-print(f"  {'Bucket':<14} {'Notional':>15}")
+print("  Points Risk (USD notional by segment):")
+print(f"  {'Segment':<14} {'Net Exposure':>15}")
 print(f"  {'-'*14} {'-'*15}")
-for label, risk in bucket_risk.items():
-    print(f"  {label:<14} ${risk:>14,.0f}")
-print(f"\n  {'Total':<14} ${sum(bucket_risk.values()):>14,.0f}")
+for label, exp in ordered:
+    print(f"  {label:<14} ${exp:>14,.0f}")
 print("=" * W)
