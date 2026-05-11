@@ -598,7 +598,8 @@ def write_html(
     path.write_text(html_text, encoding="utf-8")
 
 
-def load_existing_output(path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+def load_existing_output(path: Path | str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Existing Excel output not found: {path}")
 
