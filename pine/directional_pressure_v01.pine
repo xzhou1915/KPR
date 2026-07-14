@@ -102,6 +102,9 @@ if barstate.isfirst and fastHorizonWeight + middleHorizonWeight + slowHorizonWei
 f_clamp(float value, float lower, float upper) =>
     math.max(lower, math.min(upper, value))
 
+f_tanh(float value) =>
+    not na(value) ? 2.0 / (1.0 + math.exp(-2.0 * value)) - 1.0 : na
+
 f_ewm_std(float source, int span, bool update) =>
     float alpha = 2.0 / (span + 1.0)
     var float runningMean = na
@@ -316,7 +319,7 @@ f_horizon(
     float composite = f_weighted_mean4(
          zEfficiency, zShock, zBreakout, zClose,
          efficiencyWeight, shockWeight, breakoutWeight, closeWeight)
-    float pressure = not na(composite) ? math.tanh(composite / 2.0) : na
+    float pressure = f_tanh(composite / 2.0)
     float sampleQuality = f_weighted_mean4(
          not na(zEfficiency) ? efficiencyQuality : na,
          not na(zShock) ? shockQuality : na,
@@ -563,10 +566,10 @@ fill(upperNeutral, lowerNeutral, color = color.new(color.gray, 92), title = "Neu
 bgcolor(shadeStates ? stateBackground : na, title = "Directional state shading")
 
 plot(pressure, "Directional pressure", color = pressureColor, linewidth = 3)
-plot(showComponents ? math.tanh(displayedEfficiency / 2.0) : na, "Efficiency pressure", color = color.rgb(33, 150, 243), linewidth = 1)
-plot(showComponents ? math.tanh(displayedShock / 2.0) : na, "Shock pressure", color = color.rgb(255, 152, 0), linewidth = 1)
-plot(showComponents ? math.tanh(displayedBreakout / 2.0) : na, "Breakout pressure", color = color.rgb(156, 39, 176), linewidth = 1)
-plot(showComponents ? math.tanh(displayedClose / 2.0) : na, "Close/rejection pressure", color = color.rgb(121, 85, 72), linewidth = 1)
+plot(showComponents ? f_tanh(displayedEfficiency / 2.0) : na, "Efficiency pressure", color = color.rgb(33, 150, 243), linewidth = 1)
+plot(showComponents ? f_tanh(displayedShock / 2.0) : na, "Shock pressure", color = color.rgb(255, 152, 0), linewidth = 1)
+plot(showComponents ? f_tanh(displayedBreakout / 2.0) : na, "Breakout pressure", color = color.rgb(156, 39, 176), linewidth = 1)
+plot(showComponents ? f_tanh(displayedClose / 2.0) : na, "Close/rejection pressure", color = color.rgb(121, 85, 72), linewidth = 1)
 plot(showHorizons ? displayedPressure40 : na, "Fast-horizon pressure", color = color.new(color.aqua, 25), linewidth = 1)
 plot(showHorizons ? displayedPressure60 : na, "Middle-horizon pressure", color = color.new(color.yellow, 25), linewidth = 1)
 plot(showHorizons ? displayedPressure80 : na, "Slow-horizon pressure", color = color.new(color.fuchsia, 25), linewidth = 1)
