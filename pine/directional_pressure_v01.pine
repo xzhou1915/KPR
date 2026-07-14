@@ -1,0 +1,618 @@
+//@version=6
+indicator(
+     "Directional Pressure v0.1 [Descriptive]",
+     shorttitle = "DirPressure v0.1",
+     overlay = false,
+     max_bars_back = 2500)
+
+// Directional Pressure v0.1
+// Measures whether upward or downward price paths currently encounter less
+// resistance. It uses only the chart's own OHLC history. It is descriptive,
+// not a next-return forecast or a trading strategy.
+//
+// The defaults reproduce model 0.1.0-frozen-before-holdout. The broad model
+// did not pass its full cross-asset holdout gate; breakout acceptance was the
+// only component that passed independently. Treat modified settings as a new,
+// unvalidated model.
+
+const string GROUP_HORIZONS = "1. Horizons"
+const string GROUP_VOLATILITY = "2. Volatility normalization"
+const string GROUP_EFFICIENCY = "3. Movement efficiency"
+const string GROUP_SHOCKS = "4. Shock response"
+const string GROUP_BREAKOUTS = "5. Breakout acceptance"
+const string GROUP_NORMALIZATION = "6. Component normalization"
+const string GROUP_WEIGHTS = "7. Model weights"
+const string GROUP_CONFIDENCE = "8. Confidence"
+const string GROUP_DISPLAY = "9. Display and alerts"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Inputs
+// ─────────────────────────────────────────────────────────────────────────────
+
+int horizon1 = input.int(40, "Fast horizon", minval = 20, maxval = 500, group = GROUP_HORIZONS,
+     tooltip = "Number of chart bars in the fastest behavioral window. Research default: 40.")
+int horizon2 = input.int(60, "Middle horizon", minval = 20, maxval = 500, group = GROUP_HORIZONS,
+     tooltip = "Number of chart bars in the middle behavioral window. Research default: 60.")
+int horizon3 = input.int(80, "Slow horizon", minval = 20, maxval = 500, group = GROUP_HORIZONS,
+     tooltip = "Number of chart bars in the slowest behavioral window. Research default: 80.")
+
+int volatilitySpan = input.int(20, "EW volatility span", minval = 5, maxval = 250, group = GROUP_VOLATILITY,
+     tooltip = "Exponentially weighted span used to estimate return volatility. The estimate is lagged one bar.")
+
+int efficiencySegment = input.int(5, "Segment length", minval = 2, maxval = 50, group = GROUP_EFFICIENCY,
+     tooltip = "Bars used to compare net displacement with total path length.")
+float efficiencyThreshold = input.float(0.50, "Significant-move threshold (vol units)", minval = 0.0, maxval = 5.0, step = 0.05, group = GROUP_EFFICIENCY,
+     tooltip = "A segment counts only when its displacement exceeds this multiple of volatility × square-root(segment length).")
+int minimumDirectionBars = input.int(8, "Minimum observations per direction", minval = 1, maxval = 100, group = GROUP_EFFICIENCY)
+
+int responseHorizon = input.int(5, "Response period", minval = 1, maxval = 20, group = GROUP_SHOCKS,
+     tooltip = "Bars waited before a shock or breakout response is considered mature.")
+float shockThreshold = input.float(1.0, "Shock threshold (vol units)", minval = 0.1, maxval = 10.0, step = 0.1, group = GROUP_SHOCKS,
+     tooltip = "Absolute one-bar return divided by lagged volatility required to create a shock event.")
+int minimumEvents = input.int(3, "Minimum events per direction", minval = 1, maxval = 50, group = GROUP_SHOCKS,
+     tooltip = "Minimum mature positive and negative events required for shock and breakout comparisons.")
+
+int breakoutWindow = input.int(20, "Prior range length", minval = 5, maxval = 250, group = GROUP_BREAKOUTS,
+     tooltip = "An upside/downside breakout closes beyond the preceding high/low over this many bars.")
+int breakoutMemoryFloor = input.int(180, "Minimum event-memory bars", minval = 20, maxval = 2000, group = GROUP_BREAKOUTS,
+     tooltip = "Breakouts are sparse, so their event history can be longer than the main horizon.")
+float breakoutMemoryMultiple = input.float(3.0, "Horizon memory multiple", minval = 1.0, maxval = 10.0, step = 0.25, group = GROUP_BREAKOUTS,
+     tooltip = "Breakout memory is max(minimum event-memory bars, horizon × this multiple).")
+
+int standardizationWindow = input.int(126, "Trailing scale window", minval = 30, maxval = 1000, group = GROUP_NORMALIZATION)
+int standardizationMinimum = input.int(30, "Minimum valid scale observations", minval = 10, maxval = 500, group = GROUP_NORMALIZATION)
+float componentClip = input.float(3.0, "Normalized component cap", minval = 0.5, maxval = 10.0, step = 0.25, group = GROUP_NORMALIZATION,
+     tooltip = "Each normalized component is clipped to plus/minus this value.")
+
+float efficiencyWeight = input.float(1.0, "Efficiency weight", minval = 0.0, maxval = 10.0, step = 0.25, group = GROUP_WEIGHTS)
+float shockWeight = input.float(1.0, "Shock-response weight", minval = 0.0, maxval = 10.0, step = 0.25, group = GROUP_WEIGHTS)
+float breakoutWeight = input.float(1.0, "Breakout-acceptance weight", minval = 0.0, maxval = 10.0, step = 0.25, group = GROUP_WEIGHTS)
+float closeWeight = input.float(1.0, "Close/rejection weight", minval = 0.0, maxval = 10.0, step = 0.25, group = GROUP_WEIGHTS)
+float fastHorizonWeight = input.float(1.0, "Fast-horizon weight", minval = 0.0, maxval = 10.0, step = 0.25, group = GROUP_WEIGHTS)
+float middleHorizonWeight = input.float(1.0, "Middle-horizon weight", minval = 0.0, maxval = 10.0, step = 0.25, group = GROUP_WEIGHTS)
+float slowHorizonWeight = input.float(1.0, "Slow-horizon weight", minval = 0.0, maxval = 10.0, step = 0.25, group = GROUP_WEIGHTS)
+
+float sampleQualityWeight = input.float(0.45, "Sample-quality weight", minval = 0.0, maxval = 1.0, step = 0.05, group = GROUP_CONFIDENCE)
+float componentAgreementWeight = input.float(0.25, "Component-agreement weight", minval = 0.0, maxval = 1.0, step = 0.05, group = GROUP_CONFIDENCE)
+float horizonAgreementWeight = input.float(0.20, "Horizon-agreement weight", minval = 0.0, maxval = 1.0, step = 0.05, group = GROUP_CONFIDENCE)
+float availabilityWeight = input.float(0.10, "Availability weight", minval = 0.0, maxval = 1.0, step = 0.05, group = GROUP_CONFIDENCE)
+float confidenceFloor = input.float(0.25, "Weak-signal confidence multiplier", minval = 0.0, maxval = 1.0, step = 0.05, group = GROUP_CONFIDENCE,
+     tooltip = "Multiplier used when pressure strength is zero. It rises linearly to 1 at the strong threshold.")
+
+float neutralThreshold = input.float(0.20, "Neutral boundary", minval = 0.01, maxval = 0.90, step = 0.05, group = GROUP_DISPLAY)
+float strongThreshold = input.float(0.50, "Strong boundary", minval = 0.05, maxval = 0.99, step = 0.05, group = GROUP_DISPLAY)
+bool showComponents = input.bool(false, "Show component pressures", group = GROUP_DISPLAY)
+bool showHorizons = input.bool(false, "Show horizon pressures", group = GROUP_DISPLAY)
+bool showConfidence = input.bool(false, "Show confidence", group = GROUP_DISPLAY)
+bool showDashboard = input.bool(true, "Show dashboard", group = GROUP_DISPLAY)
+bool shadeStates = input.bool(true, "Shade directional states", group = GROUP_DISPLAY)
+
+if barstate.isfirst and neutralThreshold >= strongThreshold
+    runtime.error("Neutral boundary must be smaller than the strong boundary.")
+if barstate.isfirst and efficiencyWeight + shockWeight + breakoutWeight + closeWeight <= 0
+    runtime.error("At least one component weight must be greater than zero.")
+if barstate.isfirst and fastHorizonWeight + middleHorizonWeight + slowHorizonWeight <= 0
+    runtime.error("At least one horizon weight must be greater than zero.")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stateful causal helpers. Arrays advance only on confirmed bars.
+// Each written function call has its own persistent history in Pine.
+// ─────────────────────────────────────────────────────────────────────────────
+
+f_clamp(float value, float lower, float upper) =>
+    math.max(lower, math.min(upper, value))
+
+f_ewm_std(float source, int span, bool update) =>
+    float alpha = 2.0 / (span + 1.0)
+    var float runningMean = na
+    var float biasedVariance = na
+    var float squaredWeightSum = na
+    var int observationCount = 0
+    if update and not na(source)
+        if observationCount == 0
+            runningMean := source
+            biasedVariance := 0.0
+            squaredWeightSum := 1.0
+            observationCount := 1
+        else
+            float delta = source - runningMean
+            biasedVariance := (1.0 - alpha) * (biasedVariance + alpha * delta * delta)
+            runningMean := runningMean + alpha * delta
+            squaredWeightSum := math.pow(1.0 - alpha, 2) * squaredWeightSum + alpha * alpha
+            observationCount += 1
+    float denominator = 1.0 - squaredWeightSum
+    observationCount >= span and denominator > 1e-12 ? math.sqrt(biasedVariance / denominator) : na
+
+f_ewm_mean(float source, int span, int minimum, bool update) =>
+    float alpha = 2.0 / (span + 1.0)
+    var float result = na
+    var int observationCount = 0
+    if update and not na(source)
+        result := na(result) ? source : result + alpha * (source - result)
+        observationCount += 1
+    observationCount >= minimum ? result : na
+
+f_sparse_median_count(float value, int length, int minimum, bool update) =>
+    var array<float> values = array.new<float>()
+    var int validCount = 0
+    if update
+        array.push(values, value)
+        if not na(value)
+            validCount += 1
+        if array.size(values) > length
+            float removed = array.shift(values)
+            if not na(removed)
+                validCount -= 1
+    float medianValue = validCount >= minimum ? array.median(values) : na
+    [medianValue, validCount]
+
+f_zero_centered_scale(float value, int length, int minimum, float clip, bool update) =>
+    var array<float> absoluteValues = array.new<float>()
+    var int validCount = 0
+    var float squaredSum = 0.0
+    if update
+        float absoluteValue = not na(value) ? math.abs(value) : na
+        array.push(absoluteValues, absoluteValue)
+        if not na(absoluteValue)
+            validCount += 1
+            squaredSum += absoluteValue * absoluteValue
+        if array.size(absoluteValues) > length
+            float removed = array.shift(absoluteValues)
+            if not na(removed)
+                validCount -= 1
+                squaredSum -= removed * removed
+    float robustScale = validCount >= minimum ? 1.4826 * array.median(absoluteValues) : na
+    float fallbackScale = validCount >= minimum and validCount > 0 ? math.sqrt(math.max(squaredSum, 0.0) / validCount) : na
+    float activeScale = not na(robustScale) and robustScale > 1e-12 ? robustScale : fallbackScale
+    not na(value) and not na(activeScale) and activeScale > 1e-12 ? f_clamp(value / activeScale, -clip, clip) : na
+
+f_weighted_mean4(float a, float b, float c, float d, float wa, float wb, float wc, float wd) =>
+    float numerator = 0.0
+    float denominator = 0.0
+    if not na(a) and wa > 0
+        numerator += a * wa
+        denominator += wa
+    if not na(b) and wb > 0
+        numerator += b * wb
+        denominator += wb
+    if not na(c) and wc > 0
+        numerator += c * wc
+        denominator += wc
+    if not na(d) and wd > 0
+        numerator += d * wd
+        denominator += wd
+    denominator > 0 ? numerator / denominator : na
+
+f_weighted_mean3(float a, float b, float c, float wa, float wb, float wc) =>
+    float numerator = 0.0
+    float denominator = 0.0
+    if not na(a) and wa > 0
+        numerator += a * wa
+        denominator += wa
+    if not na(b) and wb > 0
+        numerator += b * wb
+        denominator += wb
+    if not na(c) and wc > 0
+        numerator += c * wc
+        denominator += wc
+    denominator > 0 ? numerator / denominator : na
+
+f_available_mean3(float a, float b, float c) =>
+    f_weighted_mean3(a, b, c, 1.0, 1.0, 1.0)
+
+f_agreement4(float a, float b, float c, float d, float target) =>
+    int meaningful = 0
+    int agreeing = 0
+    if not na(a) and math.abs(a) > 0.10
+        meaningful += 1
+        agreeing += a * target > 0 ? 1 : 0
+    if not na(b) and math.abs(b) > 0.10
+        meaningful += 1
+        agreeing += b * target > 0 ? 1 : 0
+    if not na(c) and math.abs(c) > 0.10
+        meaningful += 1
+        agreeing += c * target > 0 ? 1 : 0
+    if not na(d) and math.abs(d) > 0.10
+        meaningful += 1
+        agreeing += d * target > 0 ? 1 : 0
+    meaningful > 0 ? float(agreeing) / meaningful : 0.50
+
+f_agreement3(float a, float b, float c, float target) =>
+    int meaningful = 0
+    int agreeing = 0
+    if not na(a) and math.abs(a) > 0.10
+        meaningful += 1
+        agreeing += a * target > 0 ? 1 : 0
+    if not na(b) and math.abs(b) > 0.10
+        meaningful += 1
+        agreeing += b * target > 0 ? 1 : 0
+    if not na(c) and math.abs(c) > 0.10
+        meaningful += 1
+        agreeing += c * target > 0 ? 1 : 0
+    meaningful > 0 ? float(agreeing) / meaningful : 0.50
+
+f_acceptance(bool maturedEvent, float boundary, bool upside, int responseBars, float logClose) =>
+    float result = na
+    if maturedEvent and not na(boundary)
+        int accepted = 0
+        int observed = 0
+        for offset = 0 to responseBars - 1
+            float pathClose = logClose[offset]
+            if not na(pathClose)
+                observed += 1
+                accepted += upside ? (pathClose > boundary ? 1 : 0) : (pathClose < boundary ? 1 : 0)
+        result := observed == responseBars ? float(accepted) / responseBars : na
+    result
+
+f_horizon(
+     int horizon,
+     float positiveEfficiencySample,
+     float negativeEfficiencySample,
+     float positiveShockResponse,
+     float negativeShockContinuation,
+     float positiveShockRetention,
+     float negativeShockRetention,
+     float upsideAcceptance,
+     float downsideAcceptance,
+     float closeRejectionBar,
+     int scaleMinimum,
+     bool update) =>
+
+    [positiveEfficiencyMedian, positiveEfficiencyCount] = f_sparse_median_count(
+         positiveEfficiencySample, horizon, minimumDirectionBars, update)
+    [negativeEfficiencyMedian, negativeEfficiencyCount] = f_sparse_median_count(
+         negativeEfficiencySample, horizon, minimumDirectionBars, update)
+    float efficiencyRaw = not na(positiveEfficiencyMedian) and not na(negativeEfficiencyMedian) ?
+         positiveEfficiencyMedian - negativeEfficiencyMedian : na
+    int directionalTarget = math.max(minimumDirectionBars, int(math.floor(horizon / 3.0)))
+    float efficiencyQuality = f_clamp(
+         float(math.min(positiveEfficiencyCount, negativeEfficiencyCount)) /
+         efficiencySegment / directionalTarget, 0.0, 1.0)
+
+    [positiveShockMedian, positiveShockCount] = f_sparse_median_count(
+         positiveShockResponse, horizon, minimumEvents, update)
+    [negativeShockMedian, negativeShockCount] = f_sparse_median_count(
+         negativeShockContinuation, horizon, minimumEvents, update)
+    [positiveRetentionMedian, positiveRetentionCount] = f_sparse_median_count(
+         positiveShockRetention, horizon, minimumEvents, update)
+    [negativeRetentionMedian, negativeRetentionCount] = f_sparse_median_count(
+         negativeShockRetention, horizon, minimumEvents, update)
+    float continuationAsymmetry = not na(positiveShockMedian) and not na(negativeShockMedian) ?
+         positiveShockMedian - negativeShockMedian : na
+    float retentionAsymmetry = not na(positiveRetentionMedian) and not na(negativeRetentionMedian) ?
+         positiveRetentionMedian - negativeRetentionMedian : na
+    float shockRaw = not na(continuationAsymmetry) and not na(retentionAsymmetry) ?
+         0.5 * (continuationAsymmetry + retentionAsymmetry) : na
+    int shockTarget = math.max(minimumEvents, int(math.floor(horizon / 12.0)))
+    float shockQuality = f_clamp(
+         float(math.min(positiveShockCount, negativeShockCount)) / shockTarget, 0.0, 1.0)
+
+    int breakoutMemory = math.max(
+         breakoutMemoryFloor, int(math.round(horizon * breakoutMemoryMultiple)))
+    [upsideAcceptanceMedian, upsideBreakoutCount] = f_sparse_median_count(
+         upsideAcceptance, breakoutMemory, minimumEvents, update)
+    [downsideAcceptanceMedian, downsideBreakoutCount] = f_sparse_median_count(
+         downsideAcceptance, breakoutMemory, minimumEvents, update)
+    float breakoutRaw = not na(upsideAcceptanceMedian) and not na(downsideAcceptanceMedian) ?
+         upsideAcceptanceMedian - downsideAcceptanceMedian : na
+    int breakoutTarget = math.max(minimumEvents, int(math.floor(breakoutMemory / 50.0)))
+    float breakoutQuality = f_clamp(
+         float(math.min(upsideBreakoutCount, downsideBreakoutCount)) / breakoutTarget, 0.0, 1.0)
+
+    int closeSpan = math.max(5, int(math.floor(horizon / 4.0)))
+    int closeMinimum = math.max(5, int(math.floor(closeSpan / 2.0)))
+    float closeRaw = f_ewm_mean(closeRejectionBar, closeSpan, closeMinimum, update)
+    float closeQuality = 1.0
+
+    float zEfficiency = f_zero_centered_scale(
+         efficiencyRaw, standardizationWindow, scaleMinimum, componentClip, update)
+    float zShock = f_zero_centered_scale(
+         shockRaw, standardizationWindow, scaleMinimum, componentClip, update)
+    float zBreakout = f_zero_centered_scale(
+         breakoutRaw, standardizationWindow, scaleMinimum, componentClip, update)
+    float zClose = f_zero_centered_scale(
+         closeRaw, standardizationWindow, scaleMinimum, componentClip, update)
+
+    float composite = f_weighted_mean4(
+         zEfficiency, zShock, zBreakout, zClose,
+         efficiencyWeight, shockWeight, breakoutWeight, closeWeight)
+    float pressure = not na(composite) ? math.tanh(composite / 2.0) : na
+    float sampleQuality = f_weighted_mean4(
+         not na(zEfficiency) ? efficiencyQuality : na,
+         not na(zShock) ? shockQuality : na,
+         not na(zBreakout) ? breakoutQuality : na,
+         not na(zClose) ? closeQuality : na,
+         efficiencyWeight, shockWeight, breakoutWeight, closeWeight)
+    [zEfficiency, zShock, zBreakout, zClose, sampleQuality, pressure]
+
+f_state(float pressure, float neutral, float strong) =>
+    string result = "Unavailable"
+    if not na(pressure)
+        result := pressure <= -strong ? "Strong down" :
+             pressure < -neutral ? "Down" :
+             pressure <= neutral ? "Neutral" :
+             pressure < strong ? "Up" : "Strong up"
+    result
+
+f_state_color(float pressure, float neutral, float strong) =>
+    color result = color.gray
+    if not na(pressure)
+        result := pressure <= -strong ? color.rgb(183, 28, 28) :
+             pressure < -neutral ? color.rgb(239, 83, 80) :
+             pressure <= neutral ? color.rgb(120, 123, 134) :
+             pressure < strong ? color.rgb(38, 166, 154) : color.rgb(0, 121, 107)
+    result
+
+f_number(float value) =>
+    na(value) ? "n/a" : str.tostring(value, "#.###")
+
+f_percent(float value) =>
+    na(value) ? "n/a" : str.tostring(100.0 * value, "#.0") + "%"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared price transformations and event detection
+// ─────────────────────────────────────────────────────────────────────────────
+
+bool update = barstate.isconfirmed
+float logOpen = math.log(open)
+float logHigh = math.log(high)
+float logLow = math.log(low)
+float logClose = math.log(close)
+float logReturn = logClose - logClose[1]
+
+float currentEwVolatility = f_ewm_std(logReturn, volatilitySpan, update)
+float laggedVolatility = currentEwVolatility[1]
+float standardizedReturn = not na(laggedVolatility) and laggedVolatility > 1e-12 ?
+     logReturn / laggedVolatility : na
+
+// Five-bar (or user-selected) movement efficiency.
+float segmentDisplacement = logClose - logClose[efficiencySegment]
+float segmentPath = math.sum(math.abs(logReturn), efficiencySegment)
+float segmentEfficiency = not na(segmentPath) and segmentPath > 1e-12 ?
+     f_clamp(math.abs(segmentDisplacement) / segmentPath, 0.0, 1.0) : na
+float segmentScale = laggedVolatility[efficiencySegment] * math.sqrt(efficiencySegment)
+bool significantSegment = not na(segmentScale) and
+     math.abs(segmentDisplacement) >= efficiencyThreshold * segmentScale
+float positiveEfficiencySample = update and significantSegment and segmentDisplacement > 0 ? segmentEfficiency : na
+float negativeEfficiencySample = update and significantSegment and segmentDisplacement < 0 ? segmentEfficiency : na
+
+// Shock events. The refractory period suppresses overlapping response windows.
+bool rawPositiveShock = not na(standardizedReturn) and standardizedReturn >= shockThreshold
+bool rawNegativeShock = not na(standardizedReturn) and standardizedReturn <= -shockThreshold
+var int nextShockAllowed = 0
+bool positiveShockEvent = false
+bool negativeShockEvent = false
+if update and bar_index >= nextShockAllowed and (rawPositiveShock or rawNegativeShock)
+    positiveShockEvent := rawPositiveShock
+    negativeShockEvent := rawNegativeShock
+    nextShockAllowed := bar_index + responseHorizon + 1
+
+bool maturedPositiveShock = positiveShockEvent[responseHorizon]
+bool maturedNegativeShock = negativeShockEvent[responseHorizon]
+float eventVolatility = laggedVolatility[responseHorizon]
+float terminalResponse = not na(eventVolatility) and eventVolatility > 1e-12 ?
+     (logClose - logClose[responseHorizon]) /
+     (eventVolatility * math.sqrt(responseHorizon)) : na
+float positiveShockResponse = update and maturedPositiveShock ? terminalResponse : na
+float negativeShockContinuation = update and maturedNegativeShock ? -terminalResponse : na
+
+float responseLow = ta.lowest(logLow, responseHorizon)
+float responseHigh = ta.highest(logHigh, responseHorizon)
+float eventMove = math.abs(logReturn[responseHorizon])
+float positiveShockRetention = na
+float negativeShockRetention = na
+if update and not na(eventMove) and eventMove > 1e-12
+    if maturedPositiveShock
+        float giveback = math.max(0.0, logClose[responseHorizon] - responseLow)
+        positiveShockRetention := 1.0 - 2.0 * math.min(giveback / eventMove, 1.0)
+    if maturedNegativeShock
+        float rebound = math.max(0.0, responseHigh - logClose[responseHorizon])
+        negativeShockRetention := 1.0 - 2.0 * math.min(rebound / eventMove, 1.0)
+
+// Breakout events and their five-bar (or user-selected) acceptance paths.
+float priorHigh = ta.highest(logHigh[1], breakoutWindow)
+float priorLow = ta.lowest(logLow[1], breakoutWindow)
+bool rawUpsideBreakout = not na(priorHigh) and logClose > priorHigh
+bool rawDownsideBreakout = not na(priorLow) and logClose < priorLow
+var int nextBreakoutAllowed = 0
+bool upsideBreakoutEvent = false
+bool downsideBreakoutEvent = false
+if update and bar_index >= nextBreakoutAllowed and (rawUpsideBreakout or rawDownsideBreakout)
+    upsideBreakoutEvent := rawUpsideBreakout
+    downsideBreakoutEvent := rawDownsideBreakout
+    nextBreakoutAllowed := bar_index + responseHorizon + 1
+
+bool maturedUpsideBreakout = upsideBreakoutEvent[responseHorizon]
+bool maturedDownsideBreakout = downsideBreakoutEvent[responseHorizon]
+float upsideAcceptanceCandidate = f_acceptance(
+     maturedUpsideBreakout, priorHigh[responseHorizon], true, responseHorizon, logClose)
+float downsideAcceptanceCandidate = f_acceptance(
+     maturedDownsideBreakout, priorLow[responseHorizon], false, responseHorizon, logClose)
+float upsideAcceptance = update ? upsideAcceptanceCandidate : na
+float downsideAcceptance = update ? downsideAcceptanceCandidate : na
+
+// Close location and wick rejection, calculated in log-price space.
+float previousLogClose = logClose[1]
+float trueHigh = na(previousLogClose) ? logHigh : math.max(logHigh, previousLogClose)
+float trueLow = na(previousLogClose) ? logLow : math.min(logLow, previousLogClose)
+float trueBarRange = trueHigh - trueLow
+float closeLocation = trueBarRange > 1e-12 ?
+     f_clamp((2.0 * logClose - trueHigh - trueLow) / trueBarRange, -1.0, 1.0) : na
+float logBarRange = logHigh - logLow
+float lowerWick = math.min(logOpen, logClose) - logLow
+float upperWick = logHigh - math.max(logOpen, logClose)
+float wickRejection = logBarRange > 1e-12 ?
+     f_clamp((lowerWick - upperWick) / logBarRange, -1.0, 1.0) : na
+float closeRejectionBar = 0.5 * nz(closeLocation, 0.0) + 0.5 * nz(wickRejection, 0.0)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Three independent horizon calculations
+// ─────────────────────────────────────────────────────────────────────────────
+
+int scaleMinimum = math.min(standardizationMinimum, standardizationWindow)
+
+[efficiency40, shock40, breakout40, close40, sample40, pressure40] = f_horizon(
+     horizon1, positiveEfficiencySample, negativeEfficiencySample,
+     positiveShockResponse, negativeShockContinuation,
+     positiveShockRetention, negativeShockRetention,
+     upsideAcceptance, downsideAcceptance, closeRejectionBar, scaleMinimum, update)
+
+[efficiency60, shock60, breakout60, close60, sample60, pressure60] = f_horizon(
+     horizon2, positiveEfficiencySample, negativeEfficiencySample,
+     positiveShockResponse, negativeShockContinuation,
+     positiveShockRetention, negativeShockRetention,
+     upsideAcceptance, downsideAcceptance, closeRejectionBar, scaleMinimum, update)
+
+[efficiency80, shock80, breakout80, close80, sample80, pressure80] = f_horizon(
+     horizon3, positiveEfficiencySample, negativeEfficiencySample,
+     positiveShockResponse, negativeShockContinuation,
+     positiveShockRetention, negativeShockRetention,
+     upsideAcceptance, downsideAcceptance, closeRejectionBar, scaleMinimum, update)
+
+float finalEfficiency = f_weighted_mean3(
+     efficiency40, efficiency60, efficiency80,
+     fastHorizonWeight, middleHorizonWeight, slowHorizonWeight)
+float finalShock = f_weighted_mean3(
+     shock40, shock60, shock80,
+     fastHorizonWeight, middleHorizonWeight, slowHorizonWeight)
+float finalBreakout = f_weighted_mean3(
+     breakout40, breakout60, breakout80,
+     fastHorizonWeight, middleHorizonWeight, slowHorizonWeight)
+float finalClose = f_weighted_mean3(
+     close40, close60, close80,
+     fastHorizonWeight, middleHorizonWeight, slowHorizonWeight)
+float pressureCalculation = f_weighted_mean3(
+     pressure40, pressure60, pressure80,
+     fastHorizonWeight, middleHorizonWeight, slowHorizonWeight)
+float sampleQuality = f_weighted_mean3(
+     sample40, sample60, sample80,
+     fastHorizonWeight, middleHorizonWeight, slowHorizonWeight)
+
+int availableComponents =
+     (not na(finalEfficiency) and efficiencyWeight > 0 ? 1 : 0) +
+     (not na(finalShock) and shockWeight > 0 ? 1 : 0) +
+     (not na(finalBreakout) and breakoutWeight > 0 ? 1 : 0) +
+     (not na(finalClose) and closeWeight > 0 ? 1 : 0)
+int enabledComponents =
+     (efficiencyWeight > 0 ? 1 : 0) +
+     (shockWeight > 0 ? 1 : 0) +
+     (breakoutWeight > 0 ? 1 : 0) +
+     (closeWeight > 0 ? 1 : 0)
+float availability = enabledComponents > 0 ? float(availableComponents) / enabledComponents : 0.0
+float componentAgreement = f_agreement4(
+     efficiencyWeight > 0 ? finalEfficiency : na,
+     shockWeight > 0 ? finalShock : na,
+     breakoutWeight > 0 ? finalBreakout : na,
+     closeWeight > 0 ? finalClose : na,
+     pressureCalculation)
+float horizonAgreement = f_agreement3(
+     fastHorizonWeight > 0 ? pressure40 : na,
+     middleHorizonWeight > 0 ? pressure60 : na,
+     slowHorizonWeight > 0 ? pressure80 : na,
+     pressureCalculation)
+float directionalStrength = not na(pressureCalculation) ?
+     f_clamp(math.abs(pressureCalculation) / strongThreshold, 0.0, 1.0) : na
+float confidenceWeightTotal = sampleQualityWeight + componentAgreementWeight +
+     horizonAgreementWeight + availabilityWeight
+float baseConfidence = confidenceWeightTotal > 0 and not na(pressureCalculation) ?
+     (sampleQualityWeight * nz(sampleQuality, 0.0) +
+      componentAgreementWeight * componentAgreement +
+      horizonAgreementWeight * horizonAgreement +
+      availabilityWeight * availability) / confidenceWeightTotal : na
+float confidenceCalculation = not na(baseConfidence) ?
+     f_clamp(baseConfidence * availability *
+     (confidenceFloor + (1.0 - confidenceFloor) * directionalStrength), 0.0, 1.0) : na
+
+// Hold all public outputs until the realtime candle is confirmed.
+var float pressure = na
+var float confidence = na
+var float displayedEfficiency = na
+var float displayedShock = na
+var float displayedBreakout = na
+var float displayedClose = na
+var float displayedPressure40 = na
+var float displayedPressure60 = na
+var float displayedPressure80 = na
+if update
+    pressure := pressureCalculation
+    confidence := confidenceCalculation
+    displayedEfficiency := finalEfficiency
+    displayedShock := finalShock
+    displayedBreakout := finalBreakout
+    displayedClose := finalClose
+    displayedPressure40 := pressure40
+    displayedPressure60 := pressure60
+    displayedPressure80 := pressure80
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plots, dashboard, and alerts
+// ─────────────────────────────────────────────────────────────────────────────
+
+color pressureColor = f_state_color(pressure, neutralThreshold, strongThreshold)
+color stateBackground = pressure >= strongThreshold ? color.new(color.teal, 90) :
+     pressure > neutralThreshold ? color.new(color.green, 93) :
+     pressure <= -strongThreshold ? color.new(color.red, 90) :
+     pressure < -neutralThreshold ? color.new(color.maroon, 93) : na
+
+zeroLine = hline(0.0, "Zero", color = color.new(color.gray, 55))
+upperNeutral = hline(neutralThreshold, "Upper neutral", color = color.new(color.gray, 35), linestyle = hline.style_dotted)
+lowerNeutral = hline(-neutralThreshold, "Lower neutral", color = color.new(color.gray, 35), linestyle = hline.style_dotted)
+upperStrong = hline(strongThreshold, "Strong up", color = color.new(color.teal, 45), linestyle = hline.style_dashed)
+lowerStrong = hline(-strongThreshold, "Strong down", color = color.new(color.red, 45), linestyle = hline.style_dashed)
+fill(upperNeutral, lowerNeutral, color = color.new(color.gray, 92), title = "Neutral zone")
+bgcolor(shadeStates ? stateBackground : na, title = "Directional state shading")
+
+plot(pressure, "Directional pressure", color = pressureColor, linewidth = 3)
+plot(showComponents ? math.tanh(displayedEfficiency / 2.0) : na, "Efficiency pressure", color = color.rgb(33, 150, 243), linewidth = 1)
+plot(showComponents ? math.tanh(displayedShock / 2.0) : na, "Shock pressure", color = color.rgb(255, 152, 0), linewidth = 1)
+plot(showComponents ? math.tanh(displayedBreakout / 2.0) : na, "Breakout pressure", color = color.rgb(156, 39, 176), linewidth = 1)
+plot(showComponents ? math.tanh(displayedClose / 2.0) : na, "Close/rejection pressure", color = color.rgb(121, 85, 72), linewidth = 1)
+plot(showHorizons ? displayedPressure40 : na, "Fast-horizon pressure", color = color.new(color.aqua, 25), linewidth = 1)
+plot(showHorizons ? displayedPressure60 : na, "Middle-horizon pressure", color = color.new(color.yellow, 25), linewidth = 1)
+plot(showHorizons ? displayedPressure80 : na, "Slow-horizon pressure", color = color.new(color.fuchsia, 25), linewidth = 1)
+plot(showConfidence ? confidence : na, "Confidence", color = color.white, linewidth = 2, style = plot.style_stepline)
+
+var table dashboard = table.new(position.top_right, 2, 11,
+     frame_color = color.new(color.gray, 50), frame_width = 1,
+     border_color = color.new(color.gray, 75), border_width = 1)
+if barstate.islast
+    table.clear(dashboard, 0, 0, 1, 10)
+    if showDashboard
+        color headerColor = color.new(pressureColor, 15)
+        table.cell(dashboard, 0, 0, "Directional Pressure", text_color = color.white, bgcolor = headerColor)
+        table.cell(dashboard, 1, 0, "v0.1", text_color = color.white, bgcolor = headerColor)
+        table.cell(dashboard, 0, 1, "State", text_color = color.silver)
+        table.cell(dashboard, 1, 1, f_state(pressure, neutralThreshold, strongThreshold), text_color = pressureColor)
+        table.cell(dashboard, 0, 2, "Pressure", text_color = color.silver)
+        table.cell(dashboard, 1, 2, f_number(pressure), text_color = pressureColor)
+        table.cell(dashboard, 0, 3, "Confidence", text_color = color.silver)
+        table.cell(dashboard, 1, 3, f_percent(confidence), text_color = color.white)
+        table.cell(dashboard, 0, 4, "Efficiency", text_color = color.silver)
+        table.cell(dashboard, 1, 4, f_number(displayedEfficiency), text_color = color.white)
+        table.cell(dashboard, 0, 5, "Shock response", text_color = color.silver)
+        table.cell(dashboard, 1, 5, f_number(displayedShock), text_color = color.white)
+        table.cell(dashboard, 0, 6, "Breakout", text_color = color.silver)
+        table.cell(dashboard, 1, 6, f_number(displayedBreakout), text_color = color.white)
+        table.cell(dashboard, 0, 7, "Close/rejection", text_color = color.silver)
+        table.cell(dashboard, 1, 7, f_number(displayedClose), text_color = color.white)
+        table.cell(dashboard, 0, 8, "Horizons", text_color = color.silver)
+        table.cell(dashboard, 1, 8,
+             f_number(displayedPressure40) + " / " + f_number(displayedPressure60) + " / " + f_number(displayedPressure80),
+             text_color = color.white)
+        table.cell(dashboard, 0, 9, "Update", text_color = color.silver)
+        table.cell(dashboard, 1, 9, update ? "Bar confirmed" : "Waiting for close", text_color = update ? color.lime : color.orange)
+        table.cell(dashboard, 0, 10, "Research status", text_color = color.white, bgcolor = color.new(color.red, 35))
+        table.cell(dashboard, 1, 10, "Descriptive only", text_color = color.white, bgcolor = color.new(color.red, 35))
+
+bool enteredUp = ta.crossover(pressure, neutralThreshold)
+bool enteredDown = ta.crossunder(pressure, -neutralThreshold)
+bool enteredStrongUp = ta.crossover(pressure, strongThreshold)
+bool enteredStrongDown = ta.crossunder(pressure, -strongThreshold)
+bool returnedNeutralFromUp = ta.crossunder(pressure, neutralThreshold)
+bool returnedNeutralFromDown = ta.crossover(pressure, -neutralThreshold)
+
+alertcondition(update and enteredUp, "Directional Pressure entered Up", "Directional Pressure crossed above the neutral zone on {{ticker}} {{interval}}.")
+alertcondition(update and enteredDown, "Directional Pressure entered Down", "Directional Pressure crossed below the neutral zone on {{ticker}} {{interval}}.")
+alertcondition(update and enteredStrongUp, "Directional Pressure entered Strong Up", "Directional Pressure crossed into Strong Up on {{ticker}} {{interval}}.")
+alertcondition(update and enteredStrongDown, "Directional Pressure entered Strong Down", "Directional Pressure crossed into Strong Down on {{ticker}} {{interval}}.")
+alertcondition(update and (returnedNeutralFromUp or returnedNeutralFromDown), "Directional Pressure returned to Neutral", "Directional Pressure returned to the neutral zone on {{ticker}} {{interval}}.")
