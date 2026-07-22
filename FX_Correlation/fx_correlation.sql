@@ -83,10 +83,13 @@ correlation_components AS (
 SELECT
     p.CCY_1,
     p.CCY_2,
-    CASE
-        WHEN ISNULL(c.observations, 0) < 2 THEN NULL
-        ELSE c.numerator / NULLIF(c.denominator, 0.0)
-    END AS Correlation
+    CAST(
+        CASE
+            WHEN ISNULL(c.observations, 0) < 2 THEN NULL
+            ELSE ROUND(c.numerator / NULLIF(c.denominator, 0.0), 2)
+        END
+        AS decimal(4, 2)
+    ) AS Correlation
 FROM ticker_pairs AS p
 LEFT JOIN correlation_components AS c
     ON c.CCY_1 = p.CCY_1
