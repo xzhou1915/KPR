@@ -1,4 +1,4 @@
--- Pairwise Pearson correlation of simple percentage returns in SQL Server.
+-- Full N x N pairwise Pearson correlation matrix of simple percentage returns.
 -- Replace dbo.FX_Prices with the name of the source table.
 -- The source is expected to contain one row per [Date] and Ticker.
 
@@ -12,6 +12,19 @@
             ORDER BY [Date]
         ) AS previous_value
     FROM dbo.FX_Prices
+),
+ticker_universe AS (
+    SELECT DISTINCT
+        Ticker
+    FROM price_lags
+    WHERE Ticker IS NOT NULL
+),
+ticker_pairs AS (
+    SELECT
+        t1.Ticker AS CCY_1,
+        t2.Ticker AS CCY_2
+    FROM ticker_universe AS t1
+    CROSS JOIN ticker_universe AS t2
 ),
 returns AS (
     SELECT
@@ -30,7 +43,6 @@ paired_returns AS (
     FROM returns AS r1
     INNER JOIN returns AS r2
         ON r2.[Date] = r1.[Date]
-       AND r2.Ticker > r1.Ticker
     WHERE r1.pct_return IS NOT NULL
       AND r2.pct_return IS NOT NULL
 ),
@@ -69,13 +81,16 @@ correlation_components AS (
         m.observations
 )
 SELECT
-    CCY_1,
-    CCY_2,
+    p.CCY_1,
+    p.CCY_2,
     CASE
-        WHEN observations < 2 THEN NULL
-        ELSE numerator / NULLIF(denominator, 0.0)
+        WHEN ISNULL(c.observations, 0) < 2 THEN NULL
+        ELSE c.numerator / NULLIF(c.denominator, 0.0)
     END AS Correlation
-FROM correlation_components
+FROM ticker_pairs AS p
+LEFT JOIN correlation_components AS c
+    ON c.CCY_1 = p.CCY_1
+   AND c.CCY_2 = p.CCY_2
 ORDER BY
-    CCY_1,
-    CCY_2;
+    p.CCY_1,
+    p.CCY_2;
